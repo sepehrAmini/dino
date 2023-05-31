@@ -53,12 +53,14 @@ class VOC12Dataset(Dataset):
         return len(self.img_name_list)
 
 
-def build_dataset(is_train):
+def build_dataset(is_train, transform=None):
+    if transform is None:
+        transform = build_transform()
     if is_train:
         return VOC12Dataset(img_name_list_path='voc12', voc12_root='/Datasets/VOCdevkit/VOC2012',
-                                    train=True, gen_attn=False, transform=build_transform())
+                                    train=True, gen_attn=False, transform=transform)
     return VOC12Dataset(img_name_list_path='voc12', voc12_root='/Datasets/VOCdevkit/VOC2012',
-                                train=False, gen_attn=False, transform=build_transform())
+                                train=False, gen_attn=False, transform=transform)
 
 
 

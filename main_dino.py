@@ -153,8 +153,8 @@ def train_dino(args):
     #     pin_memory=True,
     #     drop_last=True,
     # )
-    dataset = build_dataset(is_train=False, gen_attn=True, args=args)
-    sampler = torch.utils.data.RandomSampler(dataset)
+    dataset = build_dataset(is_train=False, transform=transform)
+    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,

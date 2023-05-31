@@ -33,6 +33,7 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from datasets import build_dataset
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -142,16 +143,27 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    # data_loader = torch.utils.data.DataLoader(
+    #     dataset,
+    #     sampler=sampler,
+    #     batch_size=args.batch_size_per_gpu,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    #     drop_last=True,
+    # )
+    dataset = build_dataset(is_train=False, gen_attn=True, args=args)
+    sampler = torch.utils.data.RandomSampler(dataset)
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
-        batch_size=args.batch_size_per_gpu,
-        num_workers=args.num_workers,
+        batch_size=8,
+        num_workers=10,
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,
     )
+
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============

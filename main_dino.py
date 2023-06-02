@@ -64,6 +64,8 @@ def get_args_parser():
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
         help="Whether to use batch normalizations in projection head (Default: False)")
+    parser.add_argument('--pretrained_weights', default='', type=str,
+        help="Path to pretrained weights to load.")
 
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
@@ -159,7 +161,7 @@ def train_dino(args):
         dataset,
         sampler=sampler,
         batch_size=8,
-        num_workers=10,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
     )
@@ -177,6 +179,7 @@ def train_dino(args):
         )
         teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
         embed_dim = student.embed_dim
+        print("It's a ViT. ")
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
         student = torch.hub.load('facebookresearch/xcit:main', args.arch,
@@ -198,6 +201,7 @@ def train_dino(args):
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     ))
+    print(student)
     teacher = utils.MultiCropWrapper(
         teacher,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
@@ -216,6 +220,39 @@ def train_dino(args):
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+
+    if os.path.isfile(args.pretrained_weights):
+        state_dict = torch.load(args.pretrained_weights, map_location="cpu")
+        if args.checkpoint_key is not None and args.checkpoint_key in state_dict:
+            print(f"Take key {args.checkpoint_key} in provided checkpoint dict")
+            state_dict = state_dict[args.checkpoint_key]
+        # remove `module.` prefix
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        # remove `backbone.` prefix induced by multicrop wrapper
+        state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
+        msg = student.load_state_dict(state_dict, strict=False)
+        print('Pretrained weights found at {} and loaded with msg: {}'.format(args.pretrained_weights, msg))
+    else:
+        print("Please use the `--pretrained_weights` argument to indicate the path of the checkpoint to evaluate.")
+        url = None
+        if args.arch == "vit_small" and args.patch_size == 16:
+            url = "dino_deitsmall16_pretrain/dino_deitsmall16_pretrain.pth"
+        elif args.arch == "vit_small" and args.patch_size == 8:
+            url = "dino_deitsmall8_300ep_pretrain/dino_deitsmall8_300ep_pretrain.pth"  # model used for visualizations in our paper
+        elif args.arch == "vit_base" and args.patch_size == 16:
+            url = "dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
+        elif args.arch == "vit_base" and args.patch_size == 8:
+            url = "dino_vitbase8_pretrain/dino_vitbase8_pretrain.pth"
+        if url is not None:
+            print("Since no pretrained weights have been provided, we load the reference pretrained DINO weights.")
+            state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)
+            state_dict = {'module.backbone.' + k : v for k, v in state_dict.items()}
+            student.load_state_dict(state_dict, strict=False)
+        else:
+            print("There is no reference weights available for this model => We use random weights.")
+
+
+
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -278,6 +315,7 @@ def train_dino(args):
 
     start_time = time.time()
     print("Starting DINO training !")
+    loss_list = []
     for epoch in range(start_epoch, args.epochs):
         if epoch % 10 == 5:
             print(f"on epoch {epoch}...")
@@ -288,6 +326,8 @@ def train_dino(args):
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
+        loss_list.append(train_stats['loss'])
+
         # ============ writing logs ... ============
         save_dict = {
             'student': student.state_dict(),
@@ -297,6 +337,7 @@ def train_dino(args):
             'args': args,
             'dino_loss': dino_loss.state_dict(),
         }
+
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
@@ -309,6 +350,10 @@ def train_dino(args):
                 f.write(json.dumps(log_stats) + "\n")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    with open('./loss.txt', 'w') as fp:
+        for item in loss_list:
+            # write each item on a new line
+            fp.write("%s\n" % str(item))
     print('Training time {}'.format(total_time_str))
 
 
@@ -317,7 +362,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, targets) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -329,9 +374,12 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            teacher_self_supervised, _ = teacher(images[:2])  # only the 2 global views pass through the teacher
+            student_self_supervised, student_supervised = student(images)
+            self_supervised_loss = dino_loss(student_self_supervised, teacher_self_supervised, epoch)
+            # supervised_loss = F.multilabel_soft_margin_loss(student_supervised.cpu(), targets.cpu().repeat(10, 1))
+            # loss = 0.05 * supervised_loss + 0.95 * self_supervised_loss
+            loss = self_supervised_loss
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)

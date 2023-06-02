@@ -277,6 +277,11 @@ class DINOHead(nn.Module):
         self.last_layer.weight_g.data.fill_(1)
         if norm_last_layer:
             self.last_layer.weight_g.requires_grad = False
+        
+        # self.supervised_layer = nn.Sequential(
+        #     nn.Linear(out_dim, 20, bias=False),
+        #     nn.Softmax(dim=1)
+        # )
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -288,4 +293,5 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
         x = self.last_layer(x)
-        return x
+        # return x, self.supervised_layer(x)
+        return x, None
